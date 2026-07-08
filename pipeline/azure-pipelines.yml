@@ -1,1 +1,204 @@
+# Only deploy from main — triggering on '*' deploys every branch to infra, which is unsafe.
+trigger:
+  branches:
+    include:
+      - main
 
+# Do not run this deployment pipeline for pull requests.
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  appName: myapp
+  imageName: myapp-api
+  # Pin images to the build ID instead of 'latest' so each deploy is reproducible.
+  imageTag: $(Build.BuildId)
+
+stages:
+  - stage: Build
+    displayName: Build Container Image
+    jobs:
+      - job: BuildImage
+        displayName: Build Docker Image
+        steps:
+          - script: |
+              echo "Building $(imageName):$(imageTag)"
+              docker build -t $(imageName):$(imageTag) .
+            displayName: Build Docker Image
+            workingDirectory: $(Build.SourcesDirectory)
+
+          # Save the image as a pipeline artifact so each environment can push to its own ACR.
+          - script: |
+              docker save $(imageName):$(imageTag) -o $(Build.ArtifactStagingDirectory)/$(imageName).tar
+            displayName: Export Image Tarball
+
+          - publish: $(Build.ArtifactStagingDirectory)/$(imageName).tar
+            artifact: container-image
+            displayName: Publish Image Artifact
+
+  - stage: DeployNonprod
+    displayName: Deploy to Nonprod
+    dependsOn: Build
+    variables:
+      environment: nonprod
+      # Matches Terraform: acr${replace("myapp-nonprod", "-", "")}
+      acrName: acrmyappnonprod
+      acrLoginServer: acrmyappnonprod.azurecr.io
+      azureSubscription: Nonprod-ServiceConnection
+      # Secret variables — configure in Azure DevOps Library (never commit real values):
+      # NONPROD_DATABASE_CONNECTION_STRING, NONPROD_API_KEY, NONPROD_DATADOG_API_KEY
+    jobs:
+      - job: DeployNonprod
+        displayName: Terraform Deploy - Nonprod
+        steps:
+          - checkout: self
+
+          - download: current
+            artifact: container-image
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: 1.6.6
+
+          # Authenticate via the service connection — avoids hardcoded SP credentials in YAML.
+          - task: AzureCLI@2
+            displayName: Push Image to Nonprod ACR
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                docker load -i $(Pipeline.Workspace)/container-image/$(imageName).tar
+                az acr login --name $(acrName)
+                docker tag $(imageName):$(imageTag) $(acrLoginServer)/$(imageName):$(imageTag)
+                docker push $(acrLoginServer)/$(imageName):$(imageTag)
+
+          - task: AzureCLI@2
+            displayName: Terraform Plan - Nonprod
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                cd terraform
+                terraform init -input=false
+                terraform plan -input=false \
+                  -var-file="configuration/nonprod.tfvars" \
+                  -var="image_tag=$(imageTag)" \
+                  -var="database_connection_string=$(NONPROD_DATABASE_CONNECTION_STRING)" \
+                  -var="api_key=$(NONPROD_API_KEY)" \
+                  -var="datadog_api_key=$(NONPROD_DATADOG_API_KEY)" \
+                  -out=nonprod.tfplan
+
+          - task: AzureCLI@2
+            displayName: Terraform Apply - Nonprod
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                cd terraform
+                terraform apply -input=false -auto-approve nonprod.tfplan
+
+          - task: AzureCLI@2
+            displayName: Verify Nonprod Deployment
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                cd terraform
+                APP_URL=$(terraform output -raw container_app_url)
+                echo "Checking ${APP_URL}/health"
+                curl --fail --retry 5 --retry-delay 10 "${APP_URL}/health"
+
+  - stage: DeployProd
+    displayName: Deploy to Production
+    dependsOn: DeployNonprod
+    variables:
+      environment: prod
+      acrName: acrmyappprod
+      acrLoginServer: acrmyappprod.azurecr.io
+      azureSubscription: Production-ServiceConnection
+      # Secret variables — configure in Azure DevOps Library (never commit real values):
+      # PROD_DATABASE_CONNECTION_STRING, PROD_API_KEY, PROD_DATADOG_API_KEY
+    jobs:
+      # deployment job + 'production' environment enables manual approval gates in Azure DevOps.
+      - deployment: DeployProd
+        displayName: Terraform Deploy - Production
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - download: current
+                  artifact: container-image
+
+                - task: TerraformInstaller@1
+                  displayName: Install Terraform
+                  inputs:
+                    terraformVersion: 1.6.6
+
+                - task: AzureCLI@2
+                  displayName: Push Image to Prod ACR
+                  inputs:
+                    azureSubscription: $(azureSubscription)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      docker load -i $(Pipeline.Workspace)/container-image/$(imageName).tar
+                      az acr login --name $(acrName)
+                      docker tag $(imageName):$(imageTag) $(acrLoginServer)/$(imageName):$(imageTag)
+                      docker push $(acrLoginServer)/$(imageName):$(imageTag)
+
+                - task: AzureCLI@2
+                  displayName: Terraform Plan - Production
+                  inputs:
+                    azureSubscription: $(azureSubscription)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      cd terraform
+                      terraform init -input=false
+                      terraform plan -input=false \
+                        -var-file="configuration/prod.tfvars" \
+                        -var="image_tag=$(imageTag)" \
+                        -var="database_connection_string=$(PROD_DATABASE_CONNECTION_STRING)" \
+                        -var="api_key=$(PROD_API_KEY)" \
+                        -var="datadog_api_key=$(PROD_DATADOG_API_KEY)" \
+                        -out=prod.tfplan
+
+                - task: AzureCLI@2
+                  displayName: Terraform Apply - Production
+                  inputs:
+                    azureSubscription: $(azureSubscription)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      cd terraform
+                      terraform apply -input=false -auto-approve prod.tfplan
+
+                - task: AzureCLI@2
+                  displayName: Verify Production Deployment
+                  inputs:
+                    azureSubscription: $(azureSubscription)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      cd terraform
+                      APP_URL=$(terraform output -raw container_app_url)
+                      echo "Checking ${APP_URL}/health"
+                      curl --fail --retry 5 --retry-delay 10 "${APP_URL}/health"
